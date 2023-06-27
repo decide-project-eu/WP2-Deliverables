@@ -19,10 +19,7 @@
 ### Start by using the *source* function to source the following script:
 
 getwd()
-source('04_DLM Walk_new_260623.R')
-
-healthy.set <- readRDS('FloridaCowData_healthy.RDS')
-sick.set <- readRDS('FloridaCowData_sick.RDS')
+source('DLM functions - DECIDE deliverable.R')
 
 # The type of data this script would be applied to is milk yield from dairy cows in a farm where mastitis is detected every now and then. Besides the variables containing yield per se, there are also variables describing milk composition, SCC and blood presence.
 # The observational units are cow-parities, meaning that she same cow will appear as two different individuals  at two different lactations. This allows for the separation of the data per lactation group, if necessary, and also isolates the developing production curve a cow has in an individual lactation. Milk yield measurements are presented on a daily basis, so the time unit is days, and the time-step unit is days in milking (dim). Cows on the first lactation are defined as "primiparous" cows, against "multiparous" cows from other lacatations. This information is contained in a variable named "ParityGroup".
