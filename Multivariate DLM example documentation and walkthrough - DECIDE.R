@@ -87,7 +87,7 @@ meta.data.sick <- sick.set[, c("Cow.Parity", "cow", "lactno", "ParityGroup", "di
 
 #############################################################################
 
-## Univariate DLM on milk yield ##
+## Multivariate DLM on milk yield ##
 
 # Use the *get.mu0_C0* (from the sourced functions file) function to make the initial parameter vector, mu0, and initial variance matrix, C0, for milk yield, and call the output "out". Use the following settings when applying for the function:
 
@@ -177,7 +177,7 @@ delta <- optimize.delta(deltas=seq(from=0.8, to=1, by=0.01),
                         mu0.list=outmu, 
                         C0.list=outc,  
                         V.list=V$V_1, 
-                        relevant.names= c('yield'), 
+                        relevant.names= names, 
                         Spline.list=Spline.list, 
                         time.var='dim', 
                         stratify.by=NA)
