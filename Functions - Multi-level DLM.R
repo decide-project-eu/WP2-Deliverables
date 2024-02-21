@@ -679,7 +679,7 @@ runSmoother <- function(res) {
   for(i in ((n-1):1))   {
     
     # Get Gt
-    Gt <- res$Gt.list[[i]]
+    Gt <- res$Gt.list[[i+1]]
     
     res$R[[i+1]] <- as.matrix(res$R[[i+1]])
     
