@@ -248,7 +248,7 @@ get.Gt <- function(Data.A=Data_, i.A=i, time.var.A=time.var, stratify.by.A=strat
     
     # We expect all parameters to follow a 2x2 structure
     k <- which(relevant.names == name)
-    i <- 2*k - 1
+    c <- 2*k - 1
     j <- 2*k
     
     # - get the relevant spline function for the upper-right element
@@ -256,22 +256,34 @@ get.Gt <- function(Data.A=Data_, i.A=i, time.var.A=time.var, stratify.by.A=strat
       Trend <- 1
     }else{
       # - get the relevant spline function
-      stratification.group <- Data_[i,stratify.by]
+      if(is.na(i)==T){
+        stratification.group <- Data_[1,stratify.by]
+      } else {
+        stratification.group <- Data_[i,stratify.by]
+      }
       spline.name <- paste(name, '_Spline_', stratification.group, sep='')
       spline.name <<- spline.name
       Spline <- Spline.list[[which(names(Spline.list)==spline.name)]]
-      
+        
+      if(is.na(i)==T){
+        time <- Data_[1,time.var]
+        time_1 <- Data_[0,time.var]
+      } else {
       time <- Data_[i,time.var]
       time_1 <- Data_[i-1,time.var]
+      }
+      
+      if(length(time_1) == 0){
+        time_1 <- (Data_[1,time.var])-1
+      }
+      
       pred <- predict(object = Spline, x = time)$y
       pred_1 <- predict(object = Spline, x = time_1)$y
-      if(length(pred_1) == 0){
-        pred_1 <- 0
-      }
+      
       Trend <- pred - pred_1
     }
    
-    Gt[i,j] <- Trend
+    Gt[c,j] <- Trend
     
   }
   
@@ -615,7 +627,7 @@ runSmoother <- function(res) {
   for(i in ((n-1):1))   {
     
     # Get Gt
-    Gt <- res$Gt.list[[i+1]]
+    Gt <- res$Gt.list[[i]]
     
     #print(i)
     res$R[[i+1]] <- as.matrix(res$R[[i+1]])
