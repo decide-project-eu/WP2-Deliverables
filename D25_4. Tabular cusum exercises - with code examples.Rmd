@@ -1,0 +1,380 @@
+---
+title: "Monitoring Dynamic Linear Model (DLM) Forecast Errors with Tabular CUSUMs"
+author: "<Your Name>"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+
+
+```{r
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Introduction to the method
+
+Cumulative sum (CUSUM) control charts are classical tools for rapid detection of small, sustained shifts in process level.  When the *in‑control* distribution of the monitored statistic is Normal $\mathcal{N}(\mu_0,\,\sigma^2)$, the **tabular CUSUM** (also called “one‑sided CUSUM” or “sequential probability‑ratio CUSUM”) offers an intuitive, recursive formulation that is straightforward to implement in R.
+
+Dynamic Linear Models (DLMs) provide one‑step‑ahead forecasts and forecast errors (residuals) that—under correctly specified models—are uncorrelated, mean‑zero and Normally distributed.  Monitoring those forecast errors with a CUSUM chart is therefore an effective way to raise early alarms for structural change in the underlying time series.
+
+In this section we review the tabular CUSUM, list its assumptions, and demonstrate an R implementation.
+
+## Theory
+
+### Tabular CUSUM Recursions
+
+Let $u_t$ be the standardized forecast error at time $t$.  Define the slack parameter $k$ (often set to half the desired detectable mean shift $\delta\sigma/2$).  The upper and lower tabular CUSUM statistics are updated as:
+
+$$
+C_t^{+} = \max\bigl(0,\, u_t - k + C_{t-1}^{+} \bigr), \quad t \ge 1 .
+$$
+
+$$
+C_t^{-} = \max\bigl(0,\,  - u_t - k + C_{t-1}^{-}\bigr), \quad t \ge 1 .
+$$
+
+
+
+An *alarm* is triggered whenever either statistic exceeds its decision limit $h$:
+
+$$
+\text{Signal if}\quad C_t^{+} \ge h \;\text{or}\; C_t^{-} \ge h.
+$$
+
+The decision interval $h$ is chosen to achieve a target in‑control Average Run Length ($ARL_0$), typically via simulation or standard tables (e.g. Lucas & Crosier 1982).
+
+### Assumptions
+
+* **Independence & Normality.** Forecast errors $e_t$ are assumed i.i.d. $\mathcal{N}(0,\sigma^2)$ *when the process is in control*.
+* **Known (or consistently estimated) ********************$\sigma$********************.** The slack parameter $k$ and decision limit $h$ depend on the standard deviation of the errors.
+* **Correct model specification.** Violations such as autocorrelated residuals will inflate the false‑alarm rate. &#x20;
+
+## R Implementation
+
+Below is the function *runTabularCusumUnivariate*.  It returns the running upper and lower CUSUM paths.
+
+```{r}
+############################################################################################
+# Function calculating the (upper and lower) tabular cusum for forecast errors
+############################################################################################
+# ut: a vector of standardized forecast errors produced by the DLM
+# slack:  The slack value (k)
+# decision: the decision limit (h); when exceeded by the tabular cusum, an alarm is raised
+############################################################################################
+# Returns a list with two vectors of cusums (upper and lower)
+############################################################################################
+runTabularCusumUnivariate = function(ut, slack, decision) {
+  # Calculate the tabular cusums
+  upperC <- numeric(length(ut))
+  lowerC <- numeric(length(ut))
+  upperC[1] <- 0
+  lowerC[1] <- 0
+  for (i in 2:length(ut)) {
+    upperC[i] <- max(0,  ut[i] - slack + upperC[i-1])
+    lowerC[i] <- max(0, -ut[i] - slack + lowerC[i-1])
+  }
+  # Apply the decision limit to automatically raise alarms
+  upperAlarms <- rep(0, length(ut))
+  lowerAlarms <- rep(0, length(ut))
+  anyAlarms <- rep(0, length(ut))
+    
+  upperAlarms[which(upperC > decision)] <- 1
+  lowerAlarms[which(lowerC < -decision)] <- 1
+  anyAlarms[which(upperAlarms == 1 | lowerAlarms == 1)] <- 1
+  
+  
+  return(list(upper = upperC, 
+              lower = lowerC,
+              upperAlarms = upperAlarms,
+              lowerAlarms = lowerAlarms,
+              anyAlarms = anyAlarms))
+}
+```
+
+The following function, *createTabularCusumPlot* wraps the *runTabularCusumUnivariate* function and creates a plot of the tabular cusums. 
+
+```{r}
+############################################################################################
+# Function creating a cusum plot with decision lines
+############################################################################################
+# ut: a vector of standardized forecast errors produced by the DLM
+# slack: The slack value (k)
+# decision: The decision level (h)
+############################################################################################
+createTabularCusumPlot = function(ut, slack, decision, Main) {
+  tabs = runTabularCusumUnivariate(ut, slack, decision)
+  amp = max(abs(tabs$upper), abs(tabs$lower))
+  plot(tabs$upper, type ='h', ylim = c(min(-amp, -decision), max(amp, decision) ), ylab='Tabular cusum', main=Main)
+  lines(-tabs$lower, type='h')
+  abline(h=decision, col = "red")
+  abline(h=-decision, col = "red")
+  abline(h = 0)
+}
+```
+
+
+## Choosing *k* and *h*
+
+For a Normal in‑control process with known $\sigma$ the slack $k$ is often fixed at $k = \delta\sigma/2$, where $\delta$ is the shift size (in $\sigma$ units) that should be detected promptly. The advantage of the tabular cusum over the standard Shewart control chart is in detecting small level shifts quickly, and so the shift size that should be detected with this method is usually relatively small, e.g. 1 $\sigma$ unit.
+
+The decision limit $h$ can be determined from Montgomery (2020) tables, Lucas & Crosier (1982), or by Monte‑Carlo simulation to hit a target $ARL_0$. According to Montgomery (2020), **"a reasonable value for $h$ is five times the process standard deviation, s"**. 
+
+If the process follows a standard normal distribution and we desire to detect a level shift of 1 $\sigma$, and we use 5 as our value for $h$, then the average run length between false alarms will be roughly 370 observations, as shown with the *xcusum.arl* below.
+
+```{r Example Monte‑Carlo ARL estimation}
+## Example Monte‑Carlo ARL estimation
+# install.packages("spc")   # first-time only
+library(spc)
+arl <- xcusum.arl(k = 0.0, h = 2, mu = 0, sided = "two") # may take some time to run
+arl
+```
+In Table 9.4 of Montgomery (2020), it is recommended to use the following combinations of slack $k$ and decision limits $h$ to achieve an average run length between false alarms ($ARL_0$) of 370 observations:
+
+  1.5 1.61
+
+| slack $k$ | decision limit $h$ |
+|----------|----------|
+| 0.25 | 8.01 |
+| 0.50 | 4.77 |
+| 0.75 | 3.34 |
+| 1.00 | 2.52 |
+| 1.25 | 1.99 |
+| 1.50 | 1.61 |
+
+Notice that as the slack value increases, the decision limit value decreases. 
+
+## Practical Tips
+
+* **Scaling:**  If $\sigma$ is unknown, standardise residuals before computing the CUSUM.
+* **Autocorrelation:**  Check the ACF of $u_t$.  Significant lags suggest model misspecification—adjust the DLM or widen $h$ to control the false‑alarm rate.
+* **Multiple series:**  For multivariate DLMs, extend to the MEWMA or Hotelling‑$T^2$ CUSUM (not covered in this course)
+
+
+### Applying the tabular cusum
+Here we will once again look at the data set *DLM_preprocessed_data__NEW_WithoutActivity.RDS*, in which the variables "consumption_liters", "visitswent", "visits", and "DrinkingSpeed" have been filtered using a multivariate DLM. 
+
+Furthermore, we will source the script *Functions for monitoring and filtering.R*, containing codes for assessing the performances. 
+
+```{r} 
+res <- readRDS("Data_restandardized.RDS")
+source('Functions for monitoring and filtering.R')
+```
+
+#### Illustrative example
+
+Initially, we can randomly select a healthy and a sick calf to apply the tabular cusum method to for illustrative purposes. For this illustration, we will only apply the function to the *ut_consumption_litres* column. 
+
+In theory, the standardized forecast errors should follow a standard normal distribution with a mean of 0 and a standard deviation of 1. Therefore, the slack $k$ is fixed at $k = \delta\sigma/2$. For this illustrations we will set \delta to 1 sigma unit and use a decision limit $h$ of 5, as recommended by 
+
+
+
+```{r}
+# Select a random healthy calf
+set.seed(42)
+healthy.calves <- unique(res$calf.herd[which(res$SickOrHealthy == 0)])
+healthy.calves <- sample(x = healthy.calves, size = 1)
+
+# Select a random sick calf
+set.seed(42)
+sick.calves <- unique(res$calf.herd[which(res$SickOrHealthy == 1)])
+sick.calves <- sample(x = sick.calves, size = 1)
+
+# Plot the selected calves
+calves <- c(healthy.calves, sick.calves)
+mains =c('healthy', 'sick')
+slack <- 0.5
+decision = 5
+for(calf in calves){
+    calf.set <- subset(res, res$calf.herd == calf)
+    createTabularCusumPlot(ut = calf.set[,'ut_consumption_liters'], 
+                           slack = slack, 
+                           decision = decision, Main = mains[which(calves==calf)])
+}
+
+```
+Notice that no alarms were raised for the sick calf using these settings. 
+
+#### Performance assesment - using Montgomery recommendations
+
+We can now apply the tabular cusum method to the standardized forecast errors of all DLM-variables for all calves and assess the performance of the method. We will systematically test the performance using values for slack $k$ from 0.25 to 1.5 by steps of 0.25, along with the corresponding values of $h$ recommended by Montgomery 2020 to achieve an $ARL_0$ of 370 observations.
+
+For this example, we will assume that the standardized forecast errors produced by the DLM are good to go as they are. 
+
+Since we are applying the method multiple times to each calf, we will do this without plotting. This is done simply by using the *runTabularCusumUnivariate* and saving the output as a data frame. We can then check the performance using the alarms for the lower limit, upper limit, and any alarms. 
+
+```{r}
+# Define the names of the standardized forecast errors
+ut.names <- c("ut_consumption_liters", "ut_visitswoent", "ut_visits", "ut_DrinkingSpeed")
+
+# Make output data frames
+performance.all <- data.frame()
+performance.all.aggregated <- data.frame()
+
+# Define the k and corresponding h values to use
+ks <- c(0.25, 0.50, 0.75, 1.00, 1.25, 1.5)
+hs <- c(8.01, 4.77, 3.34, 2.52, 1.99, 1.61)
+
+# Iterate over the ut names
+for(name in ut.names){
+  
+  # Iterate over the k and corresponding h values
+  for(k in ks){
+    h <- hs[which(ks == k)]
+    
+    # Iterate over the calves, and save the output along with the input
+    res_new <- data.frame()
+    for(calf in unique(res$calf.herd)){
+      calf.set <- subset(res, res$calf.herd == calf)
+      # Apply the V-mask to this column of standardized forecast errors using these settings
+      TabularCusum.out <- runTabularCusumUnivariate(ut = calf.set[,name], slack = k, decision = h)
+      # Turn the output list into a data frame
+      TabularCusum.out <- as.data.frame(TabularCusum.out)
+      # cbind the output on to the calf.set data frame
+      calf.set <- cbind(calf.set, TabularCusum.out)
+      # Add this to the new res_new data frame
+      res_new <- rbind(res_new, calf.set)
+    }
+    
+    # For each type of alarm, assess the performance
+    for(alarmType in c("upperAlarms", "lowerAlarms", "anyAlarms" )){
+      Pred.all <- res_new[,alarmType]
+      
+      # Assess the naive performance on this ut-name with these settings
+      performance <- getPerformance(observations = res$SickOrHealthy, alarms = Pred.all)
+      performance <- cbind('Name'=name, 'k'=k, 'h'=h, 'alarmType'=alarmType, performance)
+      performance.all <- rbind(performance.all, performance)
+      
+      # Assess the performance at a per-calf level
+      res$Pred <- Pred.all
+      agg <- aggregate(res$Pred, by=list(res$calf.herd, res$SickOrHealthy), FUN=max)
+      colnames(agg) <- c('calf.herd', 'Obs', 'Pred')
+      performance <- getPerformance(observations = agg$Obs, alarms = agg$Pred)
+      performance <- cbind('Name'=name, 'k'=k, 'h'=h, 'alarmType'=alarmType, performance)
+      performance.all.aggregated <- rbind(performance.all.aggregated, performance)
+    }
+    
+    
+  }
+}
+
+
+```
+
+We can now look at the set of parameters resulting in the best naive performance.
+
+```{r}
+best.i <- which(performance.all$MMA == max(performance.all$MMA))
+print(performance.all[best.i,])
+```
+And we can look at the set of parameters resulting in the best aggregated performance.
+
+```{r}
+best.i <- which(performance.all.aggregated$MMA == max(performance.all.aggregated$MMA))
+print(performance.all.aggregated[best.i,])
+```
+
+#### Performance assessment - using shorter ARL expectations
+
+Recall that the recommendations by Montomery 2009 was for an $ARL_0$ of 370 observations. For our data, however, the longest time series is around 40 observations long. So we will use the *xcusum.arl* function to find the $h$ values that result in an $ARL_0$ of approximately 40 for values of $k$ ranging from 0.25 to 1.5 by steps of 0.25. 
+
+```{r}
+xcusum.arl(k = 0.25, h = 4.05, mu = 0, sided = "two")
+xcusum.arl(k = 0.50, h = 2.65, mu = 0, sided = "two")
+xcusum.arl(k = 0.75, h = 1.9, mu = 0, sided = "two")
+xcusum.arl(k = 1.00, h = 1.42, mu = 0, sided = "two")
+xcusum.arl(k = 1.25, h = 1.055, mu = 0, sided = "two")
+xcusum.arl(k = 1.50, h = 0.765, mu = 0, sided = "two")
+```
+
+Now we can run our performance assessment again for these new decision limits.
+
+```{r}
+# Define the names of the standardized forecast errors
+ut.names <- c("ut_consumption_liters", "ut_visitswoent", "ut_visits", "ut_DrinkingSpeed")
+
+# Make output data frames
+performance.all <- data.frame()
+performance.all.aggregated <- data.frame()
+
+# Define the k and corresponding h values to use
+ks <- c(0.25, 0.50, 0.75, 1.00, 1.25, 1.5)
+hs <- seq(from=0.5, to=8, by=0.01)
+
+expand.grid(ks, hs)
+
+# Iterate over the ut names
+for(name in ut.names){
+  
+  # Iterate over the k and corresponding h values
+  for(k in ks){
+
+    progress <- which(ks == k)/length(ks)*100
+    print(paste(progress, '%'))
+    
+    for(h in hs){
+      
+      
+      
+      # Iterate over the calves, and save the output along with the input
+    res_new <- data.frame()
+    for(calf in unique(res$calf.herd)){
+      calf.set <- subset(res, res$calf.herd == calf)
+      # Apply the V-mask to this column of standardized forecast errors using these settings
+      TabularCusum.out <- runTabularCusumUnivariate(ut = calf.set[,name], slack = k, decision = h)
+      # Turn the output list into a data frame
+      TabularCusum.out <- as.data.frame(TabularCusum.out)
+      # cbind the output on to the calf.set data frame
+      calf.set <- cbind(calf.set, TabularCusum.out)
+      # Add this to the new res_new data frame
+      res_new <- rbind(res_new, calf.set)
+    }
+    
+    # For each type of alarm, assess the performance
+    for(alarmType in c("upperAlarms", "lowerAlarms", "anyAlarms" )){
+      Pred.all <- res_new[,alarmType]
+      
+      # Assess the naive performance on this ut-name with these settings
+      performance <- getPerformance(observations = res$SickOrHealthy, alarms = Pred.all)
+      performance <- cbind('Name'=name, 'k'=k, 'h'=h, 'alarmType'=alarmType, performance)
+      performance.all <- rbind(performance.all, performance)
+      
+      # Assess the performance at a per-calf level
+      res$Pred <- Pred.all
+      agg <- aggregate(res$Pred, by=list(res$calf.herd, res$SickOrHealthy), FUN=max)
+      colnames(agg) <- c('calf.herd', 'Obs', 'Pred')
+      performance <- getPerformance(observations = agg$Obs, alarms = agg$Pred)
+      performance <- cbind('Name'=name, 'k'=k, 'h'=h, 'alarmType'=alarmType, performance)
+      performance.all.aggregated <- rbind(performance.all.aggregated, performance)
+    }
+    
+    }
+    
+  }
+}
+
+
+```
+
+We can now look at the set of parameters resulting in the best naive performance.
+
+```{r}
+best.i <- which(performance.all$MMA == max(performance.all$MMA))
+print(performance.all[best.i,])
+```
+And we can look at the set of parameters resulting in the best aggregated performance.
+
+```{r}
+best.i <- which(performance.all.aggregated$MMA == max(performance.all.aggregated$MMA))
+print(performance.all.aggregated[best.i,])
+```
+
+Notice that the performance metrics are now considerably improved!
+
+# Conclusions about the method
+
+Tabular CUSUMs provide a lightweight yet powerful complement to state‑space monitoring of DLMs.  Implemented in a handful of lines in R, they add a clearly interpretable alarm layer that safeguards real‑time forecasting pipelines against unnoticed structural change.
+
+It can be an advantage to define your slack and decision limit values to expect an $ARL_0$ which corresponds to the expected length of your time series. 
+

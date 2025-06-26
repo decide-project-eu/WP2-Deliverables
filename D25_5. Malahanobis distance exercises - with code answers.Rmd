@@ -1,0 +1,423 @@
+---
+title: "Monitoring Multivariate Forecast Errors with a χ² Control Statistic"
+author: "<Your Name>"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.width = 6,
+                      fig.height = 5,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+
+
+## Introduction to the method
+
+Dynamic Linear Models (DLMs) supply, at every time point *t*, a vector of one–step‑ahead forecast errors
+$e_t = y_t - \hat y_t$ and its $p \times p$ forecast‑error covariance matrix $Q_t$.  Because the elements of $e_t$ are **correlated** and have different units, a univariate threshold on each component is not sufficient for online monitoring.  The method summarised here transforms the error vector to a single scalar that, under the model assumptions, follows a $\chi^2$ distribution.  Comparing that statistic with a pre‑chosen quantile yields an intuitive “green / red” decision rule.
+
+## Method details
+
+### Forecast error distribution
+
+Assume the DLM is correctly specified so that
+
+$$
+  e_t \;\sim\; \mathcal N\!\bigl(\mathbf 0,\,Q_t\bigr), \qquad Q_t\succ 0. \tag{1}
+$$
+
+### Whitening transformation
+
+Every positive‑definite matrix admits a *Cholesky factorisation*
+
+$$
+  Q_t = R_t^{\mathsf T} R_t, \tag{2}
+$$
+
+where $R_t$ is upper‑triangular.  Multiplying the error vector by $R_t^{-1}$ **decorrelates and rescales** it:
+
+$$
+  u_t = R_t^{-1} e_t \;\sim\; \mathcal N\!\bigl(\mathbf 0, I_p\bigr). \tag{3}
+$$
+The following figure illustrates this for whitening transformation for the correlation between the forecast errors for the variables *visitwent* and *DringingSpeed*.
+
+![Illustration of the whitening transformation for the correlation between the forecast errors for the variables *visitwent* and *DringingSpeed*](raw vs cholesky.png)
+
+
+### Mahalanobis distance
+
+Because $u_t$ has identity covariance, its squared Euclidean norm
+
+$$
+  d_t^2 = u_t^{\mathsf T} u_t = e_t^{\mathsf T} Q_t^{-1} e_t \tag{4}
+$$
+
+obeys the *Chi‑square* law
+
+$$
+  d_t^2 \;\sim\; \chi^2_{p}. \tag{5}
+$$
+
+A one‑sided test at confidence level $1-\alpha$ therefore flags an alarm whenever
+
+$$
+  d_t^2 > q_{\chi^2_p}(1-\alpha), \tag{6}
+$$
+
+with $q_{\chi^2_p}$ the upper quantile function.
+
+### Optional dashboard scaling
+
+If several series with different dimensions $p$ are displayed side‑by‑side, it is convenient to rescale $d_t^2$ so that **all** of them share the *same* control limit corresponding to the largest dimension $p_{\max}$:
+
+$$
+  \widetilde d_t^{\,2} = d_t^2 \,\frac{q_{\chi^2_{p_{\max}}}(1-\alpha)}{q_{\chi^2_{p}}(1-\alpha)}. \tag{7}
+$$
+
+The statistic $\widetilde d_t^{\,2}$ is returned by the R helper function `get.MahalanobisDistance()` described next.
+
+
+
+## Functions for monitoring
+
+The following helper, `get.MahalanobisDistance()`, bundles the steps from the *Method* section—symmetrising the covariance matrix, whitening the error vector, computing the Mahalanobis distance, rescaling to a common χ² control limit, and extracting an upper‑tail probability.  It is suitable for both streaming and batch contexts and keeps your main analysis pipeline clear of boiler‑plate.
+
+
+
+```{r mahalanobis-function}
+#' Calculate Mahalanobis distance and χ² p‑value for DLM forecast errors
+#'
+#' @param et Numeric vector of forecast errors (length p).
+#' @param Qt Forecast‑error covariance matrix (p × p, positive‑definite).
+#' @param p_max Integer giving the maximum dimension to which distances
+#'        should be rescaled (defaults to length(et)).
+#' @param alpha Significance level for the control limit (defaults to 0.05).
+#'
+#' @return A list with components:
+#'   * d2         – Mahalanobis distance (squared)
+#'   * d2_scaled  – Distance rescaled to `p_max` degrees of freedom
+#'   * p_value    – Upper‑tail χ² probability (`df = p_max`)
+#'   * ucl        – Control limit `qchisq(1‑alpha, df = p_max)`
+#' @examples
+#' res <- get.MahalanobisDistance(et, Qt)
+#' res$p_value < 0.05  # alarm?
+#' @export
+get.MahalanobisDistance <- function(et, Qt, p_max = length(et), alpha = 0.05) {
+  stopifnot(is.numeric(et), is.matrix(Qt),
+            length(et) == nrow(Qt), nrow(Qt) == ncol(Qt))
+
+  # 1. Force exact symmetry
+  Qt <- (Qt + t(Qt)) / 2
+
+  # 2. Upper‑triangular Cholesky factor, Qt = Rᵀ R
+  R <- chol(Qt)
+
+  # 3. Whitening: u = R⁻¹ e (efficient back‑substitution)
+  u <- backsolve(R, et, transpose = TRUE)
+
+  # 4. Mahalanobis distance
+  d2 <- sum(u ^ 2)
+
+  # 5. Rescale for common dashboard limit
+  d2_scaled <- d2 * qchisq(1 - alpha, df = p_max) /
+                     qchisq(1 - alpha, df = length(et))
+
+  # 6. Tail probability
+  p_val <- pchisq(d2_scaled, df = p_max, lower.tail = FALSE)
+
+  list(
+    d2        = d2,
+    d2_scaled = d2_scaled,
+    p_value   = p_val,
+    ucl       = qchisq(1 - alpha, df = p_max)
+  )
+}
+```
+
+### Batch processing across time
+
+The *runDLM* function can be adjusted to apply the Mahalanobis distance calculations at each time step. To do this, we need to call the *get.MahalanobisDistance* function at each time step, as well as adding new storage lists for the four outputs of the *get.MahalanobisDistance* function.
+
+The following code chunk shows how to update the *runDLM* function; the comments *# <-- this is new* shows where lines have been added. 
+
+```{r mahalanobis-series}
+## A function for running the DLM
+runDLM <- function(Data, 
+                   mu0, 
+                   C0, 
+                   V, 
+                   W=NA, 
+                   adjust.W=FALSE, 
+                   delta=0.95, 
+                   relevant.names, 
+                   Spline.list=NA, 
+                   time.var, 
+                   stratify.by=NA){
+  
+  n <- nrow(Data)
+  
+  Yt.list <- list()
+  at.list <- list()		 # Define the lists
+  Rt.list <- list()
+  ft.list <- list()
+  Qt.list <- list()
+  At.list <- list()
+  et.list <- list()
+  ut.list <- list()
+  mt.list <- list()
+  Ct.list <- list()
+  Ft.list <- list()
+  VSE.list <- list()
+  Gt.list <- list()
+  d2.list <- list()  #  <-- THIS IS NEW!
+  d2_scaled.list <- list()  #  <-- THIS IS NEW!
+  p_value.list <- list()  #  <-- THIS IS NEW!
+  ucl.list <- list()  #  <-- THIS IS NEW!
+  
+  mt <- mu0				# Prior Distribution
+  Ct <- C0
+  # Make sure Ct is symmetrical
+  Ct <- (Ct + t(Ct))/2
+  Ct <<- Ct
+  
+  #When we have an multivariate DLM with trend, both mu0 and C0 are not numbers, but matrices. Thereby, remember to apply %*% in all cases. 
+  
+  for(i in (1:n)){
+    
+    # Define relevant variables as global variables
+    # - it's not pretty, but it makes it easier to use custom get.Gt and get.Ft functions
+    Data_ <<- Data
+    i <<- i
+    time.var <<- time.var
+    stratify.by <<- stratify.by
+    Spline.list <<- Spline.list
+    relevant.names <<- relevant.names
+    
+    # Get V-sum-element, to be used in the EM-algorithm
+    VSE <- getVSumElement(Data, i)
+    
+    # Get the observation vector
+    # Yt <- getYt(Data, i, relevant.names)
+    Yt <- t(as.matrix(Data[i,relevant.names]))
+    colnames(Yt) <- NULL
+    
+    # Get the observational variance (Vt), including only values related to observed variables
+    # Vt <- getVt(Data, i, V, relevant.names)
+    Vt <- V
+    Vt <<- Vt
+    
+    # Define Wt
+    if(identical(W, NA)){
+      Wt <- ((1-delta)/delta) * Ct
+      Wt <- (Wt + t(Wt))/2
+    }else{
+      Wt <- W
+    }
+    Wt <<- Wt
+    
+    # Make the DLM more adaptive in the beginning
+    if(adjust.W == TRUE & i < 5){
+      Wt <- Wt * 20000
+    }
+  
+    # Get Gt - independent of the current Yt
+    Gt <- get.Gt()
+    Gt <<- Gt
+    
+    # Get Ft given the current Yt 
+    # - only rows related to observed variables are included
+    Ft <- get.Ft()
+    Ft <<- Ft
+    
+    # Run the Kalman filter - only if we observe at least one variable!
+    mt <<- mt
+    at <- Gt %*%  mt		                   # Prior mean
+    Rt <- Gt %*%  Ct %*% t(Gt) + Wt        #! I have changes it to G'     # Prior Variance
+    Rt <<- Rt
+    
+    ft <- t(Ft) %*% at		      	         # One-step Forecast mean
+    Qt <- t(Ft) %*% Rt %*%  Ft + Vt        # One-step Forecast variance
+    
+    At <- Rt %*% Ft %*% solve(Qt)          # Adaptative Coef. matrix
+    et <- Yt  - ft	                       # one-step forecast error
+    ut <- et / sqrt(diag(Qt))              #Standardized forecast error
+    
+    # - handle the missing values
+    et.A <- et
+    et.A[which(is.na(et.A))] <- 0
+    
+    # - update the parameter vector and variance matrix
+    mt <- at + At %*% et.A                # Filtered mean
+    Ct <- Rt - At  %*% Qt %*% t(At)	      # Filtered variance
+    
+    # Make sure Ct is symmetrical
+    Ct <- (Ct + t(Ct))/2
+    Ct <<- Ct
+    
+    # Calculate the Mahalanobis distance <-- THIS IS NEW!
+    Mahalanobis.out <- get.MahalanobisDistance(et, Qt, p_max = length(et), alpha = 0.05)
+    d2 <- Mahalanobis.out$d2
+    d2_scaled <- Mahalanobis.out$d2_scaled
+    p_value <- Mahalanobis.out$p_value
+    ucl <- Mahalanobis.out$ucl
+
+    # Save the values in lists
+    Yt.list[[i]] <- Yt
+    at.list[[i]] <- at
+    Rt.list[[i]] <- Rt
+    ft.list[[i]] <- ft
+    Qt.list[[i]] <- Qt
+    At.list[[i]] <- At
+    et.list[[i]] <- et
+    ut.list[[i]] <- ut
+    mt.list[[i]] <- mt
+    Ct.list[[i]] <- Ct
+    Ft.list[[i]] <- t(Ft)
+    VSE.list[[i]] <- VSE
+    Gt.list[[i]] <- Gt
+    d2.list[[i]] <- d2 #  <-- THIS IS NEW!
+    d2_scaled.list[[i]] <- d2_scaled  #  <-- THIS IS NEW!
+    p_value.list[[i]] <- p_value  #  <-- THIS IS NEW!
+    ucl.list[[i]] <- ucl  #  <-- THIS IS NEW!
+    
+  }
+  
+
+  return(list(
+    Yt=Yt.list,
+    at=at.list,
+    Rt=Rt.list,
+    ft=ft.list,
+    Qt=Qt.list,
+    At=At.list,
+    et=et.list,
+    ut=ut.list,
+    mt=mt.list,
+    Ct=Ct.list,
+    F=Ft.list,
+    vse=VSE.list,
+    Gt.list=Gt.list,
+    d2.list,  #  <-- THIS IS NEW!
+    d2_scaled,  #  <-- THIS IS NEW!
+    p_value <- p_value,  #  <-- THIS IS NEW!
+    ucl[[i]] <- ucl  #  <-- THIS IS NEW!
+  ))
+}
+```
+
+
+## Illustrative Example
+
+Here we will look at the data set *DLM_preprocessed_data__NEW_WithoutActivity.RDS*, in wich the variables "consumption_liters", "visitswent", "visits", and "DrinkingSpeed" have been filtered using a multivariate DLM. 
+
+Furthermore, we will source the script *DLM functions - DECIDE DLM summer school.R*. 
+
+```{r}
+res <- readRDS("DLM_preprocessed_data__NEW_WithoutActivity.RDS")
+source('DLM functions - DECIDE DLM summer school.R')
+```
+
+We can randomly select a healthy and a sick calf and look at the outputs from the Mahalnanobis function.
+```{r}
+# Select a random healthy calf
+set.seed(42)
+healthy.calves <- unique(res$calf.herd[which(res$SickOrHealthy == 0)])
+healthy.calves <- sample(x = healthy.calves, size = 1)
+
+# Select a random sick calf
+set.seed(42)
+sick.calves <- unique(res$calf.herd[which(res$SickOrHealthy == 1)])
+sick.calves <- sample(x = sick.calves, size = 1)
+
+# Plot the selected calves
+calves <- c(healthy.calves, sick.calves)
+
+par(mfrow=c(2,2))
+for(calf in calves){
+  calf.set <- subset(res, res$calf.herd == calf)
+  plot(calf.set$d2_scaled, type='l', main=calf, ylab='d2_scaled')
+  lines(calf.set$ucl, col='red')
+  rug(which(calf.set$AnySickness == 1), col='red', lwd=3)
+
+  plot(calf.set$p_value, type='l', main=calf, ylab='p-value')
+  abline(h=0.05, col='red')
+  rug(which(calf.set$AnySickness == 1), col='red', lwd=3)
+}
+```
+The top row shows the healthy calf, while the bottom row shows the sick calf. The horizontal red lines represent the alarm threshold for each metric. 
+
+Notice that the upper control limit, *ucl*, which is produced as an output from the *get.MahalanobisDistance* function only applies to *d2_scale*, not *d2*. That being said, so long as none of the variables which the DLM was applied to are missing, the values of *d2* and *d2_scaled* will be identical. 
+
+### Performance assesment
+We can now assess the performance of using the outputs from the *get.MahalanobisDistance* function to raise alarms, in terms of detecting sick calves. For this purpose, we will need to source the scirpt *FUNCTION COLLECTION - RANDOM FORESTS.R*, which contains functions for performance assesment. 
+
+```{r}
+source('FUNCTION COLLECTION - RANDOM FORESTS.R')
+```
+
+#### d2_scaled
+First, we will consider the *d2_scaled* values. We can add a column called "Pred" to the *res* data frame, and set *Pred* to 1 if *d2_scaled* is at or above the upper control limit, and 0 otherwise. 
+
+```{r}
+res$Pred <- 0
+res$Pred[which(res$d2_scaled >= res$ucl)] <- 1
+```
+
+Now, we can make a data frame called "obs.n.pred", where "Obs" is set equal to *res$AnySickness*, and "Pred" is set equal to res$Pred. These specific column names are needed for the *confusion.matrix* function to work. We can now call the *confusion.matrix* function.
+```{r}
+obs.n.pred <- as.data.frame(na.omit(cbind('Obs'=res$SickOrHealthy, 'Pred'=res$Pred)))
+confusion.matrix(obs.n.pred, Title="d2_scaled, naive")
+```
+
+We see that the specificity is 89 % and the sensitivity is 20 %. This is the performance under naive assumptions. We can also aggregate the predictions to maximum values per calf, which would be more appropriate. 
+
+```{r}
+agg <- aggregate(res$Pred, by=list(res$calf.herd, res$SickOrHealthy), FUN=max)
+colnames(agg) <- c('calf.herd', 'Obs', 'Pred')
+obs.n.pred <- agg[,c('Obs','Pred')]
+confusion.matrix(obs.n.pred, Title='d2_scaled, aggregated')
+```
+We see that this gives us a specificity of 24 % and a sensitivity of 94 %. 
+
+#### p-value
+
+We now repeat the same steps for the *p-value* values, except that here an alarm is raised if the *p-value* is below 0.05. 
+
+```{r}
+# Make the pred column
+res$Pred <- 0
+res$Pred[which(res$p_value < 0.05)] <- 1
+
+# Apply the confusion.matrix function
+obs.n.pred <- as.data.frame(cbind('Obs'=res$SickOrHealthy, 'Pred'=res$Pred))
+confusion.matrix(obs.n.pred, Title='p-value, naive')
+
+# Aggregate per calf and apply the confusion.matrix function again
+agg <- aggregate(res$Pred, by=list(res$calf.herd, res$SickOrHealthy), FUN=max)
+colnames(agg) <- c('calf.herd', 'Obs', 'Pred')
+obs.n.pred <- agg[,c('Obs','Pred')]
+confusion.matrix(obs.n.pred, Title='p-value, aggregated')
+```
+We see that the naive approach yields a specificity of 89 % and a sensitivity of 20 %, while the properly aggregated approach yields a specificity of 24 % and a sensitivity of 94 %. 
+
+Notice that these values are exactly identical to those we saw for *d2_scaled*, as would be expected. 
+
+## Discussion of the method
+
+The whitening–Mahalanobis approach converts a correlated error vector into a single $\chi^2$ statistic.  This enables *simple, interpretable* control charts for multivariate forecast monitoring and can be implemented in a few lines of R code.
+
+*Equation 5* shows that under correct model specification, the Mahalanobis distance provides a direct, distribution‑free mapping from $\mathcal N(\mathbf 0, Q_t)$ to a $\chi^2$ distribution.  In practice you should:
+
+* verify that $Q_t$ is positive‑definite (or apply a near‑PD repair),
+* choose $\alpha$ according to the desired false‑alarm rate (e.g. 5 %), and
+* consider robust alternatives (e.g. t‑based distances) if heavy tails are suspected.
+
+It is worth noting that although the performances achieved with this data set were not impressive, other studies have shown that the Mahalanobis distance method can be useful on other data sets, eg. [KAPPEL PAPER CITATION]. 
+
+
+
+

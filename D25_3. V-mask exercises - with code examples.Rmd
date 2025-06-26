@@ -1,0 +1,408 @@
+---
+title: "Monitoring Dynamic Linear Models with V‑Mask CUSUM"
+author: "<Your Name>"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 4)
+```
+
+## Introduction to the method
+
+Cumulative‐sum (CUSUM) charts are a staple of statistical process control for detecting small, persistent shifts in the mean of a process.  **V‑masks** provide an intuitive, *retrospective* decision rule for CUSUM charts: a pre‑defined V‑shaped overlay is slid along the tail of the chart, and an alarm is raised whenever any part of the historic CUSUM path penetrates the V.
+
+When the monitored process is produced by a **Dynamic Linear Model (DLM)**, the standardized one‑step‐ahead forecast errors form the natural input to a CUSUM/V‑mask scheme.This section reviews the underlying assumptions, presents the geometry and equations of the V‑mask, and supplies reproducible R code for applying the method to DLM residuals.
+
+## The V‑Mask Geometry
+
+The two‑sided V‑mask is defined by two parameters:
+
+* **Decision interval** $dist$ – controls the *vertical arm length* (distance from the vertex to each arm at the current time).
+* **Reference value** $angle$ – controls the *slope* of each arm (in CUSUM units per time step).
+
+Let $C_t$ be the cumulative sum of standardized forecast errors up to time $t$,
+
+$$
+C_t = \sum_{i=1}^{t} u_i, \qquad u_i = \frac{y_i - \hat{y}_{i|i-1}}{\hat\sigma},
+$$
+
+where $u_i \sim \operatorname{N}(0,1)$ *if* the DLM is correctly specified.
+
+With the **vertex**—the pivot point where the two arms meet—placed at $(t_0, C_{t_0})$, the upper and lower arm equations are
+
+
+$$
+\begin{aligned}
+UCL_{t} &= C_{t_0} + dist + angle\,(t - t_0),\\
+LCL_{t} &= C_{t_0} - dist - angle\,(t - t_0), \qquad t \ge t_0.
+\end{aligned}
+$$
+
+**Alarm rule:**
+
+> Reject the in‑control hypothesis at the first $t > t_0$ such that $C_t > UCL_t$ or $C_t < LCL_t$.
+
+The choice $(dist,angle)$ is often linked to desired average run length (ARL) properties via approximations; a common heuristic sets $angle = 0.5\,\delta$ and $dist = 5\,\sigma$ for detecting a shift of size $\delta$. Alternatively, the values can be optimized using a learning data set. 
+
+## Assumptions
+
+1. **Independence** – The standardized forecast errors $u_t$ are assumed serially uncorrelated (white noise) when the system is in control.
+2. **Normality** – $u_t \sim \operatorname{N}(0,1)$ 
+3. **Parameter stability** – The DLM parameters used to compute $\hat{y}_{t|t-1}$ and $\hat\sigma$ are either known or re‑estimated infrequently so as not to distort the control limits.
+4. **Fixed sampling interval** – Observations arrive at equally spaced time points.
+
+Violations of these assumptions will increase false‑alarm rates.
+
+## Relevant functions
+The following is a function for calculating the CUSUM of the standardized forecast errors.
+
+```{r}
+#########################################################################################
+# Function to calculate the cumulative sum of forecast errors for univariate models.
+# The forecast errors can, optionally, be standardized.
+#########################################################################################
+# x: A vector of values, for which the CUSUM will be calculated
+#########################################################################################
+runCusumUnivariate = function(x) {
+  cusum = c()
+  cusum[1] = 0
+  for (i in 2:length(x)) {
+    cusum[i] = sum(x[2:i])
+  }
+  return(cusum)
+}
+```
+
+The function below is a direct implementation of a V‑mask alarm detector frequently used in epidemiological surveillance.  Each block is heavily commented to clarify its purpose.
+
+```{r vmask-function, eval=FALSE}
+##############################################################################
+# runV.mask
+# ---------
+# Inputs:
+#   cusums: result object returned by runCusumUnivariate(), containing cumulative sums of forecast errors.
+#   dist  : V‑mask lead distance (horizontal offset of the vertex in time).
+#   angle : slope of each arm of the V‑mask (in CUSUM units per time step).
+#   reset : logical; if TRUE, restart CUSUM at 0 after an alarm.
+##############################################################################
+
+runV.mask <- function(cusums, dist, angle, reset = TRUE) {
+  ## Pre‑allocate container -------------------------------------------------
+  n    <- length(cusums)
+  mask <- matrix(FALSE, nrow = n, ncol = 6)  # will store metadata
+  colnames(mask) <- c("t", "CUSUM", "alarmLow", "alarmHigh", "triggerIdx", "CUSUMreset")
+
+  mask[1, ] <- c(1, cusums[1], FALSE, FALSE, NA, cusums[1])
+  lastAlarm <- 0            # index of most recent alarm (for reset logic)
+  alarms    <- integer(0)   # vector to hold alarm time‑steps
+
+  for (i in 2:n) {
+    ## Populate bookkeeping columns ----------------------------------------
+    mask[i, 1] <- i
+    mask[i, 2] <- cusums[i]
+
+    alarmPrev <- mask[i - 1, 3] || mask[i - 1, 4]  # alarm at t‑1?
+
+    # Update reset CUSUM column (6) ----------------------------------------
+    delta <- cusums[i] - cusums[i - 1]
+    mask[i, 6] <- if (alarmPrev) delta else delta + mask[i - 1, 6]
+
+    currentLevel <- if (reset) mask[i, 6] else cusums[i]
+
+    ## Skip if we're immediately after a reset -----------------------------
+    if (!reset || !alarmPrev) {
+      for (j in (i - 1):(lastAlarm + 1)) {
+        lower <- currentLevel - (i - j + dist) * angle
+        upper <- currentLevel + (i - j + dist) * angle
+        prev  <- if (reset) mask[j, 6] else cusums[j]
+
+        if (prev < lower) {
+          mask[i, 3] <- TRUE     # lower‑tail alarm
+          mask[i, 5] <- j
+          alarms <- c(alarms, i)
+          if (reset) lastAlarm <- i
+        }
+        if (prev > upper) {
+          mask[i, 4] <- TRUE     # upper‑tail alarm
+          mask[i, 5] <- j
+          if (reset) lastAlarm <- i
+        }
+      }
+    }
+  }
+  
+  Pred <- apply(X = mask[,c(3,4)], MARGIN = 1, FUN = max)
+
+  return(list('mask' = mask, 'Pred' = Pred))
+}
+```
+
+When `reset = TRUE`, each alarm restarts the cumulative sum so that subsequent shifts can be detected independently.  The returned `mask` matrix can be visualised directly (e.g., with `geom_tile`) or post‑processed to extract alarm times.
+
+## Choosing realistic values for `dist` and `angle`
+
+In a **standardised CUSUM** (forecast errors scaled to roughly N(0, 1)) the two V‑mask parameters translate directly into *how steep* and *how far back* you look:
+
+| Parameter | Interpretation | Practical range |
+|-----------|----------------|-----------------|
+| `angle`   | Slope of each arm | 0.20 – 0.60 |
+| `dist`    | Lead distance – historic points the mask covers | 4 – 15 |
+
+### Heuristic for `angle`
+
+`angle` can be chosen from the size of shift (in σ) you want to detect quickly:
+
+| Target mean shift δ (σ) | Recommended `angle` (= k) |
+|-------------------------|---------------------------|
+| 0.3 – 0.5 (very small)  | 0.15 – 0.25 |
+| 0.5 – 1.0 (moderate)    | **0.25 – 0.50** |
+| 1.0 – 1.5 (large)       | 0.50 – 0.75 |
+
+Most routine surveillance uses **`angle` ≈ 0.4–0.5**.
+
+### Heuristic for `dist`
+
+A simple rule is `dist ≈ h / angle`, where `h` is the **vertical half‑height**—the vertical distance (in CUSUM σ‑units) from the V‑mask’s vertex to either arm at the pivot point; in other words, the full opening of the V at its apex is `2 h`. This keeps the geometry of the mask self‑consistent across different slopes.  If you adopt **h ≈ 4–5 σ**, typical pairs are:
+
+| `angle` | `h = 4` → `dist` | `h = 5` → `dist` |
+|---------|------------------|------------------|
+| 0.25    | 16 | 20 |
+| 0.40    | 10 | 12–13 |
+| 0.50    | 8  | **10** |
+| 0.60    | 7  | 8–9 |
+
+Shorter `dist` values (4–7) react faster but double the in‑control false‑alarm rate.
+
+### Ready‑to‑use parameter sets
+
+| Scenario | `angle` | `dist` |
+|----------|---------|--------|
+| Very cautious – catch ≥ 0.5 σ | 0.30 | 14 |
+| Balanced default             | **0.45** | **10** |
+| Aggressive – large shifts     | 0.60 | 8 |
+
+### Quick helper function
+
+```{r}
+choose_dist <- function(angle, h = 5) round(h / angle)
+choose_dist(0.45)  # returns 11
+```
+
+
+## Plotting V‑masks and alarms
+
+The next two helper functions make it painless to visualise alarms **and to retrieve all alarm time‑steps in a single call**:
+
+* **`addMaskToPlot()`** overlays a V‑mask on an existing CUSUM plot for a single alarm point.
+* **`runAndPlotV.mask()`** is an all‑in‑one wrapper that runs `runV.mask()`, draws the CUSUM series, and calls `addMaskToPlot()` for *every* alarm.  Both functions now take the **CUSUM vector directly** *and* **return the exact time‑steps where alarms occur**—so downstream analyses (e.g., computing run‑lengths) don’t need to parse the mask matrix manually.
+
+```{r vmask-plot-functions, eval=FALSE}
+##############################################################################
+# addMaskToPlot
+# -------------
+# Overlay a V‑mask for a single alarm point on an existing CUSUM plot.
+#
+# Parameters
+#   mask  : matrix returned by runV.mask().
+#   obs  : index (integer) at which the alarm is raised and the mask pivoted.
+#   dist  : V‑mask lead distance (horizontal).
+#   angle : arm slope (σ‑units per time step).
+#   reset : was runV.mask() executed with reset = TRUE?
+##############################################################################
+addMaskToPlot <- function(mask, obs, dist, angle, reset) {
+  size <- dist # min(20, obs - 1)                 # how many points to draw backwards
+  rows <- max(nrow(mask), obs + dist)      # ensure matrix is long enough
+  arms <- matrix(NA_real_, nrow = rows, ncol = 4)  # store three arm levels + x
+  base <- if (reset) mask[obs, 6] else mask[obs, 2]  # CUSUM level at vertex
+
+  ## Build the three arms point‑by‑point (working backwards in time) --------
+  for (i in (obs + dist):(obs + dist - size)) {
+    arms[i, 1] <- base - (obs + dist - i) * angle   # lower arm
+    if (i > obs - 1) arms[i, 2] <- base             # central arm
+    arms[i, 3] <- base + (obs + dist - i) * angle   # upper arm
+    arms[i, 4] <- i                                  # x‑coordinate
+  }
+
+  ## Draw the arms ----------------------------------------------------------
+  lines(arms[, 4], arms[, 1], lty = 2, col = "red", lwd = 1)
+  lines(arms[, 4], arms[, 2], lty = 2, col = "red", lwd = 1)
+  lines(arms[, 4], arms[, 3], lty = 2, col = "red", lwd = 1)
+}
+
+##############################################################################
+# runAndPlotV.mask
+# ----------------
+# Complete wrapper: runV.mask() + plot CUSUM + overlay V‑masks for every alarm.
+#
+# Parameters
+#   cusums: numeric vector of CUSUM values (length n >= 2)
+#   dist  : V‑mask lead distance
+#   angle : arm slope
+#   ylims : two‑element numeric vector giving y‑axis limits for the plot
+#   reset : logical; if TRUE the detector restarts after every alarm
+#
+# Returns
+#   The mask matrix produced by runV.mask()
+##############################################################################
+runAndPlotV.mask <- function(cusums, dist, angle, reset = TRUE) {
+  ## Run detector -----------------------------------------------------------
+  Vmask.out   <- runV.mask(cusums, dist, angle, reset)  # list(mask, alarms)
+  mask  <- Vmask.out$mask
+  Pred <- Vmask.out$Pred
+
+  ## Choose which CUSUM series to visualise --------------------------------
+  y <- if (reset) mask[, 6] else mask[, 2]
+
+  ## Baseline plot ----------------------------------------------------------
+  plot(y, type = "b", col = "blue",
+      xlab = "Time", ylab = "Cumulative sum of standardised errors",
+      ylim = range(y))
+  abline(h = 0)
+
+  ## Overlay V‑masks only at alarm obs -----------------------------------
+  alarms <- which(Pred > 0)
+  for (obs in alarms) addMaskToPlot(mask, obs, dist, angle, reset)
+
+  return(alarms)
+}
+```
+
+### Applying V-mask
+Here we will once again look at the data set *DLM_preprocessed_data__NEW_WithoutActivity.RDS*, in which the variables "consumption_liters", "visitswent", "visits", and "DrinkingSpeed" have been filtered using a multivariate DLM. 
+
+Furthermore, we will source the script *Functions for monitoring and filtering.R*, containing codes for assessing the performances. 
+
+Lastly, we will source the script called *V-mask functions.R*.
+
+```{r}
+res <- readRDS("Data_restandardized.RDS")
+source('Functions for monitoring and filtering.R')
+source('V-mask functions.R')
+```
+
+We can check the assumption of standard-normality for the standardized forecast errors of each of the DLM-filtered variables for the healthy calves.
+
+```{r}
+# Define the names of the standardized forecast errors
+ut.names <- c("ut_consumption_liters", "ut_visitswoent", "ut_visits", "ut_DrinkingSpeed")
+
+# Identify the healthy calves
+agg <- aggregate(x = res$SickOrHealthy, by=list(res$calf.herd), FUN=max)
+colnames(agg) <- c('calf.herd', 'sick')
+healthy.calves <- agg$calf.herd[which(agg$sick == 0)]
+healthy.set <- subset(res, res$calf.herd %in% healthy.calves)
+sick.calves <- agg$calf.herd[which(agg$sick == 1)]
+sick.set <- subset(res, res$calf.herd %in% sick.calves)
+
+# Check the overall distribution of the standardized forecast errors for each variable
+for(name in ut.names){
+  Mean <- round(mean(healthy.set[,name]),2)
+  SD <- round(sd(healthy.set[,name]),2)
+  print(paste(name, Mean, SD))
+}
+```
+We see that the standardized errors deviate to varying degrees from a proper standard normal distribution, but they are all pretty close. 
+
+#### Illustrative example
+Initially, we can randomly select a sick calf to apply the V-mask to for illustrative purposes. For this illustration, we will only apply the function to the *ut_consumption_litres* column. 
+
+The *runAndPlotV.mask* function returns a vector of the time steps for which an alarm was raised.
+
+Varying the values for *dist*, *angle*, and *reset* will affect the number and positions of alarms being raised. 
+
+Notice that an alarm for a given observation can only be raised *dist* time steps **after** the observation was made. 
+
+```{r Actually run the V-mask}
+# Select a random sick calf
+set.seed(42)
+calf <- sample(x = sick.calves, size = 1)
+calf.set <- subset(res, res$calf.herd == calf)
+
+# Run the V-mask and plot it
+cusums = runCusumUnivariate(calf.set$ut_consumption_liters)
+alarms <- runAndPlotV.mask(cusums =  cusums,
+                 dist = 11, 
+                 angle = 0.45, 
+                 reset = TRUE) 
+rug(alarms, col='red', lwd=3)
+
+# Look at the alarms which were raised
+print(alarms)
+```
+#### Performance assesment
+We can now apply the V-mask to the standardized forecast errors of all DLM-variables for all calves and assess the performance of the method. We will systematically test the performance using different angles and the corresponding distances 
+
+For this example, we will assume that the standardized forecast errors produced by the DLM are good to go as they are. 
+
+We will iteratively try different values for the *angle*, and set the corresponding *dist* using the predefined helper function. We will reset the cumsums to 0 when an alarm is raised. 
+
+Since we are applying the V-mask multiple times to each calf, we will do this without plotting. This is done simply by using the *runV.mask* and saving the *Pred* object
+
+```{r}
+# Make output data frames
+performance.all <- data.frame()
+performance.all.aggregated <- data.frame()
+
+# Define the angles to use
+angles <- seq(from=0.10, to=0.90, by=0.05)
+
+# Iterate over the ut names
+for(name in ut.names){
+  
+  # Iterate over the angles
+  for(angle in angles){
+    dist <- choose_dist(angle)
+    
+    # Iterate over the calves
+    Pred.all <- c()
+    for(calf in unique(res$calf.herd)){
+      calf.set <- subset(res, res$calf.herd == calf)
+      # Apply the V-mask to this column of standardized forecast errors using these settings
+      Vmask.out <- runV.mask(cusums = calf.set[,name], 
+                dist = choose_dist(angle), 
+                angle = angle, 
+                reset = TRUE)
+      Pred <- Vmask.out$Pred
+      Pred.all <- c(Pred.all, Pred)
+    }
+    
+    # Assess the naive performance on this ut-name with these settings
+    performance <- getPerformance(observations = res$SickOrHealthy, alarms = Pred.all)
+    performance <- cbind('Name'=name, 'Angle'=angle, performance)
+    performance.all <- rbind(performance.all, performance)
+    
+    # Assess the performance at a per-calf level
+    res$Pred <- Pred.all
+    agg <- aggregate(res$Pred, by=list(res$calf.herd, res$SickOrHealthy), FUN=max)
+    colnames(agg) <- c('calf.herd', 'Obs', 'Pred')
+    performance <- getPerformance(observations = agg$Obs, alarms = agg$Pred)
+    performance <- cbind('Name'=name, 'Angle'=angle, performance)
+    performance.all.aggregated <- rbind(performance.all.aggregated, performance)
+  }
+}
+
+```
+We can now look at the best naive (i.e. per-day) performances and the best aggregated (i.e. per-calf) performances.
+
+```{r}
+# Get the best naive performance
+best.i.naive <- which(performance.all$MMA == max(performance.all$MMA))
+print(performance.all[best.i.naive,])
+
+# Get the best aggregated performance
+best.i.agg <- which(performance.all.aggregated$MMA == max(performance.all.aggregated$MMA))
+print(performance.all.aggregated[best.i.agg,])
+```
+
+
+## Conclusion about the method
+
+V‑masks offer a transparent, visually appealing decision tool for CUSUM charts derived from DLM innovations.  While the classical design assumes independent, Gaussian errors, the method extends naturally to the state‑space context once residual diagnostics validate these assumptions or suitable bootstrap calibration is applied.
+
+Notice that an alarm for a given observation can only be raised *dist* time steps **after** the observation was made. Thus, unlike the other methods, the alarms of the v-mask are raised retrospektively. 
+
+

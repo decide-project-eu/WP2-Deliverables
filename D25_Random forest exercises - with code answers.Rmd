@@ -1,0 +1,613 @@
+---
+title: "DLM Summerschool 2025 - Random Forests"
+author: "Dan Børge Jensen"
+date: "2025-05-21"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Introduction to the exercises
+In this set of exercises, we wish use random forests to detect when calves are sick, based on the the output of a DLM combined with other relevant data. Thus, we use DLM to pre-process the data, and we use the random forest as a secondary model to make the final prediction. 
+
+In this exercise, we will specifically investigate which (combination of) outputs from the DLM contains the most information value with regard to detecting various signs of disease. 
+
+We will assess the various combinations of input data using per-herd cross-validation, where each herd will iteratively be held out and used for validation, while the remaining herds will be used for training. 
+
+Note that you will not always have enough data to set aside a final test set, as is the case in this example. In those cases, the performance evaluation you get from the cross-validation will have to suffice. But whenever you do have sufficient data to set aside a final test set, this is preferable, as it allows us to assess the performance on a data set which were not involved in neither training nor optimization of the model. 
+
+The random forest does not work with missing values. Therefore, before training, we need to create a version of the training set where the target and input variables are all not NA.
+
+## Q1 20 words or less
+
+### Q1.1 Using 20 words or less, describe what a random forest is.
+
+**YOUR ANSWER HERE**
+
+
+### Q1.2 Using 20 words or less, describe the potential advantages of using a random forest as an alternative to Montomery's 4 rules for raising alarms.
+
+**YOUR ANSWER HERE**
+
+
+### Q1.3 Using 20 words or less, describe what a ROC curve is.
+
+**YOUR ANSWER HERE**
+
+
+### Q1.4 Using 20 words or less, describe how a ROC curve is useful.
+
+**YOUR ANSWER HERE**
+
+\newpage
+## Q2 Setting up your working environment
+In this exercise, we will read in the data and prepare it to be used for training and testing our random forest models.
+
+### Q2.1 Load libraries
+Use the *library* function to load the following packages:
+
+* randomForest
+* pROC
+* splitstackshape
+
+
+```{r}
+library(randomForest)
+library(pROC)
+library(splitstackshape)
+```
+
+Use the *source* function to source the script called "FUNCTION COLLECTION - RANDOM FORESTS.R"
+
+```{r}
+source("FUNCTION COLLECTION - RANDOM FORESTS.R")
+```
+
+### Q2.2 Data preparations
+
+Read in the file *DLM_preprocessed_data__NEW_WithoutActivity.RDS*.
+
+The column target shows us which observations belong to a "Sick" (1) vs a "Healthy" (0) calf. Use the *table* function to see the distribution between classes of each column in the target column.  
+
+**YOUR ANSWERS HERE**
+
+```{r}
+# Get the data
+Data <- readRDS('DLM_preprocessed_data__NEW_WithoutActivity.RDS')
+
+target <-"AnySicknessNow"
+# target <- "SickOrHealthy"
+
+# See the distribution of each health metric
+table(Data[,target])
+
+```
+
+We wish to do classification, which means are target value needs to be a factor. However, right now the values in the target are numerical. Use the *as.factor* function to transform the target column into a factor variable. 
+
+```{r}
+# Turn the target variable into a factor
+Data[,target] <- as.factor(Data[,target] )
+```
+
+
+
+### Q2.5 Defining variables
+
+First, we will define the column names of the meta data (*meta.names*, used for identifying the individual calf and the herd it came from), the columns of the raw data which the DLM was applied to (*raw.names*), and the column names of the other variables which might be relevant for disease detection, but which were not suitible for DLM (*other_relevant.names*).
+
+Look at the Data set to confirm that these columns are present. 
+
+```{r}
+
+meta.names <- c(
+  "Herd",
+  "calf.herd",
+  "date"
+)
+
+# Columns the DLM was applied to
+raw.names  <- c(
+  "consumption_liters",
+  # "visitswent",
+  "visitswoent",
+  "visits",
+  "visits_with_breakoff",
+  "ratio",
+  "DrinkingSpeed"
+)
+
+# Define a list of names that are not suitable for DLM but might also be relevant
+other_relevant.names <- c(
+  "DayOfYear",
+  "age_days",
+  "DaySinceHousingDate",
+  "visits_with_breakoff",
+  "visitswoent"
+)
+
+```
+
+Now we wish to define the various outputs from the DLM we wish to use as inputs for the random forest. 
+
+First, we get the column names which relate to the standardized forecasts of the DLM. Use the *colnames* function combined with the *grep* function to select the the column names which contain the pattern "ut_" from the *Data*; call the resulting vector "ut.names". 
+
+Print *ut.names* to the console to make sure they are correct.
+
+```{r}
+  # Get standardized forecast error names
+  ut.names <- colnames(Data)[grep(pattern = 'ut_', x = colnames(Data))]
+  print(ut.names)
+```
+
+Next, we get the column names which relate to the filtered means of the DLM. Use the *colnames* function combined with the *grep* function to select the the column names which contain the pattern "mt_" from the *Data*; call the resulting vector "mt.names". 
+
+Print *mt.names* to the console to make sure they are correct.
+
+
+Explain in your own words why the "mt.names" vector is twice as long as the "ut_vector". HINT: remember the design of the multivariate DLM!
+
+**YOUR ANSWER HERE**
+
+```{r}
+  # get filtered data names
+  mt.names <- colnames(Data)[grep(pattern = 'mt_', x = colnames(Data))]
+  print(mt.names)
+
+```
+
+\newpage
+
+## Q3 Making random forests with different input data
+In this exercise, we wish to create a set of random forests which take different inputs. The utility of each set of inputs will be assessed an compared. All random forest models in this exercise will be made with default settings for *ntree*, *maxnodes*, *nodesize*, etc., as we only care about the effect of the input data. 
+
+
+### Q3.0 Make an out.all data frame
+Before anything else, we need to create an empty data frame, in which we will store the performance values achieved in the per-herd cross validations with the different input data. 
+
+Use the *data.frame* function to create an empty data frame called "out.all". 
+
+```{r}
+  out.all <- data.frame()
+```
+
+
+### Q3.1 Base-line model using raw data and per-herd cross-validation
+
+First, we make a vector called “relevant.names”, containing “mt”, “ut”, and “other”.
+We use the following code to iteratively hold out one herd as the test set, make a training set without missing values from the remaining herds, define the formula to be used for the random forest using the relevant.names vector, train the random forest on the training set, apply the trained model to the test set, and evaluating the performance in terms of the area under the ROC curve. For each test herd, the performance gets added to the out.all data frame. 
+After the for-loop, we print the out.all to the console.
+
+Look at the performance values of the 4 RF models made with only raw data. For how many of the herds do the models reach an AUC that is significantly greater than 50 %, i.e. significantly better than random guessing?
+
+*YOUR ANSWER HERE* 
+
+Would you say these model generally perform well or poor? And how do they compare with the performances you saw the Montgomery rules and V-mask? Explain your answers. 
+
+*YOUR ANSWER HERE* 
+
+```{r}
+# Define relevant.names
+relevant.names <- c(raw.names)
+
+# Make relevant.names into a string with plus signs between the original elements
+relevant.names_F <- paste(relevant.names, collapse = '+')
+
+# Make the formula
+Formula <- as.formula(paste(target, ' ~ ' , relevant.names_F) )
+
+#Print it to console
+print(Formula)
+
+# Train random forest model in a 10-fold cross alidation
+for(herd in unique(Data$Herd)){
+  
+  # Print fold to see how far along we are
+  print(herd)
+  
+  # Create the training and test set for this fold
+  training.set <- subset(Data, Data$Herd != herd)
+  test.set <- subset(Data, Data$Herd == herd)
+  
+  # Make a new data set with no missing values in the relevant columns
+  training.set_A <- training.set[,c(target, relevant.names)]
+  training.set_A <- na.omit(training.set_A)
+  
+  # Train the random forest
+  RF <- randomForest(formula = Formula, 
+                    data = training.set_A)
+  
+  # Make predictions on the test set of this fold
+  pred <- predict(object = RF, 
+                  newdata = test.set, 
+                  type = 'prob')
+  
+  # Extract the column of pred named "1", this column gives us the estimated probability for mastitis
+  pred <- pred[,'1']
+  
+  # Use the apply.roc function to get performance values
+  out <- apply.roc(obs.test = test.set[,target], 
+                   pred.test = pred)
+ 
+  # Add a column identifying the herd and a column identifying the inputs
+  out <- cbind('Herd'=herd, out, 'Inputs'='raw')
+  
+  # Add out to out.all
+  out.all <- rbind(out.all, out)
+}
+
+print(out.all)
+
+```
+
+### Q3.2 Second model using standardized forecast errors
+
+Repeat the steps from *Q3.1*, but with the standardized forecast errors ("ut") instead of the raw data; copy the code from *Q3.1* and replace all instances of "raw" with "ut". 
+
+Instead of printing out.all, use the *subset* function to extract the subset of *out.all* where *Inputs == "ut"*; call the resulting data frame "out.model" and print it. 
+
+Look at the performance values achieved for the RF models using the standardized forecast errors from the DLM as input. For how many of the herds do the models reach an AUC that is significantly greater than 50 %, i.e. significantly better than random guessing?
+
+*YOUR ANSWER HERE* 
+
+Do they tend to perform well or poor, and how do they compare with the models using only raw data? Explain your answers. 
+
+*YOUR ANSWER HERE*
+
+```{r}
+# Define relevant.names
+relevant.names <- c(ut.names)
+
+# Make relevant.names into a string with plus signs between the original elements
+relevant.names_F <- paste(relevant.names, collapse = '+')
+
+# Make the formula
+Formula <- as.formula(paste(target, ' ~ ' , relevant.names_F) )
+
+#Print it to console
+print(Formula)
+
+# Train random forest model in a 10-fold cross alidation
+for(herd in unique(Data$Herd)){
+  
+  # Print fold to see how far along we are
+  print(herd)
+  
+  # Create the training and test set for this fold
+  training.set <- subset(Data, Data$Herd != herd)
+  test.set <- subset(Data, Data$Herd == herd)
+  
+  # Make a new data set with no missing values in the relevant columns
+  training.set_A <- training.set[,c(target, relevant.names)]
+  training.set_A <- na.omit(training.set_A)
+  
+  # Train the random forest
+  RF <- randomForest(formula = Formula, 
+                    data = training.set_A)
+  
+  # Make predictions on the test set of this fold
+  pred <- predict(object = RF, 
+                  newdata = test.set, 
+                  type = 'prob')
+  
+  # Extract the column of pred named "1", this column gives us the estimated probability for mastitis
+  pred <- pred[,'1']
+  
+  # Use the apply.roc function to get performance values
+  out <- apply.roc(obs.test = test.set[,target], 
+                   pred.test = pred)
+ 
+  # Add a column identifying the herd and a column identifying the inputs
+  out <- cbind('Herd'=herd, out, 'Inputs'="ut")
+  
+  # Add out to out.all
+  out.all <- rbind(out.all, out)
+}
+
+out.model <- subset(out.all, out.all$Inputs == "ut")
+
+print(out.model)
+```
+
+
+### Q3.3 Third model using filtered means and standardized forecast errors
+
+Repeat the steps from *Q3.2*, but define *relevant.names* as *c(mt.names, ut.names)*, so that the model will use both filtered means and standardized forecast errors as input. 
+
+Also, replace all instances of "ut" with "mt_ut".
+
+Look at the performance values achieved for the RF models using the filtered means + the standardized forecast errors from the DLM as input. For how many of the herds do the models reach an AUC that is significantly greater than 50 %, i.e. significantly better than random guessing?
+
+*YOUR ANSWER HERE*
+
+Do they tend to perform well or poor, and how do they compare with the previous models we have seen so far? Explain your answers. 
+
+*YOUR ANSWER HERE*
+
+```{r}
+# Define relevant.names
+relevant.names <- c(mt.names, ut.names)
+
+# Make relevant.names into a string with plus signs between the original elements
+relevant.names_F <- paste(relevant.names, collapse = '+')
+
+# Make the formula
+Formula <- as.formula(paste(target, ' ~ ' , relevant.names_F) )
+
+#Print it to console
+print(Formula)
+
+# Train random forest model in a 10-fold cross alidation
+for(herd in unique(Data$Herd)){
+  
+  # Print fold to see how far along we are
+  print(herd)
+  
+  # Create the training and test set for this fold
+  training.set <- subset(Data, Data$Herd != herd)
+  test.set <- subset(Data, Data$Herd == herd)
+  
+  # Make a new data set with no missing values in the relevant columns
+  training.set_A <- training.set[,c(target, relevant.names)]
+  training.set_A <- na.omit(training.set_A)
+  
+  # Train the random forest
+  RF <- randomForest(formula = Formula, 
+                    data = training.set_A)
+  
+  # Make predictions on the test set of this fold
+  pred <- predict(object = RF, 
+                  newdata = test.set, 
+                  type = 'prob')
+  
+  # Extract the column of pred named "1", this column gives us the estimated probability for mastitis
+  pred <- pred[,'1']
+  
+  # Use the apply.roc function to get performance values
+  out <- apply.roc(obs.test = test.set[,target], 
+                   pred.test = pred)
+ 
+  # Add a column identifying the herd and a column identifying the inputs
+  out <- cbind('Herd'=herd, out, 'Inputs'="mt_ut")
+  
+  # Add out to out.all
+  out.all <- rbind(out.all, out)
+}
+
+out.model <- subset(out.all, out.all$Inputs == "mt_ut")
+
+print(out.model)
+```
+
+
+### Q3.4 Fourth model, using DLM outputs and other relevant variables
+
+Repeat the steps from *Q3.2*, but define *relevant.names* as *c(mt, ut, other_relevant.names)*. 
+
+Also, replace all instances of "raw_other" with "mt_ut_other".
+
+Look at the performance values achieved for the RF models using the filtered means + the standardized forecast errors from the DLM + other relevant data as input. For how many of the herds do the models reach an AUC that is significantly greater than 50 %, i.e. significantly better than random guessing?
+
+*YOUR ANSWER HERE* 
+
+Do they tend to perform well or poor, and how do they compare with the previous models we have seen so far? Explain your answers.  
+
+*YOUR ANSWER HERE*
+
+```{r}
+# Define relevant.names
+relevant.names <- c(mt.names, ut.names, other_relevant.names)
+
+# Make relevant.names into a string with plus signs between the original elements
+relevant.names_F <- paste(relevant.names, collapse = '+')
+
+# Make the formula
+Formula <- as.formula(paste(target, ' ~ ' , relevant.names_F) )
+
+#Print it to console
+print(Formula)
+
+# Train random forest model in a 10-fold cross alidation
+for(herd in unique(Data$Herd)){
+  
+  # Print fold to see how far along we are
+  print(herd)
+  
+  # Create the training and test set for this fold
+  training.set <- subset(Data, Data$Herd != herd)
+  test.set <- subset(Data, Data$Herd == herd)
+
+  # Make a new data set with no missing values in the relevant columns
+  training.set_A <- training.set[,c(target, relevant.names)]
+  training.set_A <- na.omit(training.set_A)
+  
+  # Train the random forest
+  RF <- randomForest(formula = Formula, 
+                    data = training.set_A
+                   )
+ 
+  # Make predictions on the test set of this fold
+  pred <- predict(object = RF, 
+                  newdata = test.set, 
+                  type = 'prob')
+  
+  # Extract the column of pred named "1", this column gives us the estimated probability for mastitis
+  pred <- pred[,'1']
+  
+  # Use the apply.roc function to get performance values
+  out <- apply.roc(obs.test = test.set[,target], 
+                   pred.test = pred)
+ 
+  # Add a column identifying the herd and a column identifying the inputs
+  out <- cbind('Herd'=herd, out, 'Inputs'="mt_ut_other")
+  
+  # Add out to out.all
+  out.all <- rbind(out.all, out)
+}
+
+out.model <- subset(out.all, out.all$Inputs == "mt_ut_other")
+
+print(out.model)
+```
+
+### Q3.5 Sixth model, the other relevant variables on their own
+
+Repeat the steps from *Q3.2*, but define *relevant.names* as *c(other_relevant.names)*. 
+
+Also, replace all instances of "mt_ut_other" "other".
+
+Look at the performance values achieved for the RF models using only the other relevant variables as input. For how many of the herds do the models reach an AUC that is significantly greater than 50 %, i.e. significantly better than random guessing?
+
+*YOUR ANSWER HERE* 
+
+Do they tend to perform well or poor, and how do they compare with the previous models we have seen so far? Explain your answers.  
+
+*YOUR ANSWER HERE*
+
+```{r}
+# Define relevant.names
+relevant.names <- c(other_relevant.names)
+
+# Make relevant.names into a string with plus signs between the original elements
+relevant.names_F <- paste(relevant.names, collapse = '+')
+
+# Make the formula
+Formula <- as.formula(paste(target, ' ~ ' , relevant.names_F) )
+
+#Print it to console
+print(Formula)
+
+# Train random forest model in a 10-fold cross alidation
+for(herd in unique(Data$Herd)){
+  
+  # Print fold to see how far along we are
+  print(herd)
+  
+  # Create the training and test set for this fold
+  training.set <- subset(Data, Data$Herd != herd)
+  test.set <- subset(Data, Data$Herd == herd)
+  
+  # Make a new data set with no missing values in the relevant columns
+  training.set_A <- training.set[,c(target, relevant.names)]
+  training.set_A <- na.omit(training.set_A)
+  
+  # Train the random forest
+  RF <- randomForest(formula = Formula, 
+                    data = training.set_A
+                    )
+  
+  # Make predictions on the test set of this fold
+  pred <- predict(object = RF, 
+                  newdata = test.set, 
+                  type = 'prob')
+  
+  # Extract the column of pred named "1", this column gives us the estimated probability for mastitis
+  pred <- pred[,'1']
+  
+  # Use the apply.roc function to get performance values
+  out <- apply.roc(obs.test = test.set[,target], 
+                   pred.test = pred)
+ 
+  # Add a column identifying the herd and a column identifying the inputs
+  out <- cbind('Herd'=herd, out, 'Inputs'="other")
+  
+  # Add out to out.all
+  out.all <- rbind(out.all, out)
+}
+
+out.model <- subset(out.all, out.all$Inputs == "other")
+
+print(out.model)
+```
+
+\newpage
+## Q4 Statistical analysis and comparisons
+
+Now we wish to perform a proper statistical analysis to see which modelling approaches are statistically significantly better than which other approaches. 
+
+### Q4.0
+Use the *library* function to load each of the following packages:
+
+* emmeans
+* multcomp
+* multcompView
+
+NOTICE: you may need to install these packages first. You do that with the *install.packages* function. If you need to install these packages, you should do it in the console, not in the script. 
+
+```{r}
+library(emmeans)
+library(multcomp)
+library(multcompView)
+```
+
+### Q4.1
+
+Use the *lm* function to make a linear model, describing the AUC given the input data; use the following settings:
+
+* formula = AUC ~ Inputs
+* data=out.all
+
+Use the *summary* function to see the estimated effects of each set of input variables. Explain in your own words what this summary shows us. 
+
+*YOUR ANSWER HERE*
+
+```{r}
+
+# Use the lm function to make a linear model, describing the AUC given the input data
+LM <- lm(formula = AUC ~ Inputs, data=out.all)
+summary(LM)
+```
+
+
+### Q4.2 
+Use the *emmeans* function to get the mean effect of each set of input variables, and call the resulting object "model_means"; use the following settings:
+
+* object = LM
+* specs = "Inputs"
+
+Use the *pairs* function to see pairwise comparisons of the effects of all sets of input data; use the following settings:
+
+* x = model_means
+* adjust = "sidak"
+* alpha = 0.05
+
+Look at the outputs from the *pairs* function. Are there any pairs that are statistically significantly different from each other (p-value < 0.05)? If so, which ones? Comment on whether or not you find these results surprising. Explain your answer. 
+
+*YOUR ANSWER HERE*
+
+```{r}
+# get (adjusted) weight means per group
+model_means <- emmeans(object = LM,
+                       specs = "Inputs")
+# show differences
+pairs(x = model_means, 
+      adjust = "sidak", 
+      alpha = 0.05)
+```
+### Q4.3 
+
+Now we will make a nice plot to visually represent the effects of the different sets of input data. 
+
+Use the *cld.plot* function from the *FUNCTION COLLECTION - RANDOM FORESTS.R* script. The only input to the function should be *model_means*, which you made in Q4.2.
+
+Look at the plot. Describe what it shows. How does it compare to the pair-wise comparisons you saw in Q4.2?
+
+*YOUR ANSWER HERE*
+
+Given all the results you have seen ín Q4, which modelling strategy do you think should be considered the best strategy? Explain your answer. Remember that when two models have the same performance, the simpler model should be preferred!
+
+*YOUR ANSWER HERE*
+
+
+```{r}
+cld.plot(model_means, ylim = 'AUC')
+```
+
+```{r}
+
+```
